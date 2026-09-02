@@ -81,6 +81,20 @@ _GEMINI_NUDGE_TEXT = (
 )
 
 
+class _CachedGraph(Exception):
+    """Carries a cache hit out of the query loader's try block.
+
+    The load sits inside one `try` whose `except Exception` turns any failure
+    into "could not load graph", so an early `return` is not available and a
+    plain flag would still fall through the rest of the parse. Raising is the
+    smallest change that keeps the existing error handling intact.
+    """
+
+    def __init__(self, graph):
+        super().__init__("cache hit")
+        self.graph = graph
+
+
 def _default_graph_path() -> str:
     return str(Path(_GRAPHIFY_OUT) / "graph.json")
 
@@ -1253,6 +1267,26 @@ def dispatch_command(cmd: str) -> None:
             import json as _json
             import networkx as _nx
 
+            # Cached parse (same on-disk cache as `explain`/`path`, keyed on a
+            # distinct shape: this one is undirected AND carries the _src/_tgt
+            # rewrite below, so it can never be served one of theirs).
+            from graphify.serve import (
+                _atomic_write_pickle as _awp, _graph_cache_key as _gck,
+                _graph_cache_path as _gcp, _prune_graph_cache as _pgc,
+            )
+            import pickle as _pickle
+            _qkey = _gck(gp, directed=False, multigraph=False)
+            if _qkey is not None:
+                _qkey = _qkey + ["query-srctgt"]
+                try:
+                    with _gcp(_qkey[0], _qkey).open("rb") as _fh:
+                        _b = _pickle.load(_fh)
+                    if _b.get("key") == _qkey:
+                        raise _CachedGraph(_b["graph"])
+                except _CachedGraph:
+                    raise
+                except Exception:
+                    pass
             _raw = _json.loads(gp.read_text(encoding="utf-8"))
             if "links" not in _raw and "edges" in _raw:
                 _raw = dict(_raw, links=_raw["edges"])
@@ -1282,6 +1316,13 @@ def dispatch_command(cmd: str) -> None:
                 G = json_graph.node_link_graph(_raw, edges="links")
             except TypeError:
                 G = json_graph.node_link_graph(_raw)
+            if _qkey is not None:
+                try:
+                    _d = _gcp(_qkey[0], _qkey)
+                    _awp(_d, {"key": _qkey, "graph": G})
+                    _pgc(_d)
+                except Exception:
+                    pass
             try:
                 from graphify.build import graph_has_legacy_ids as _legacy
                 if _legacy(_raw.get("nodes", [])):
@@ -1293,6 +1334,8 @@ def dispatch_command(cmd: str) -> None:
                     )
             except Exception:
                 pass
+        except _CachedGraph as _hit:
+            G = _hit.graph
         except Exception as exc:
             print(f"error: could not load graph: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -1576,20 +1619,16 @@ def dispatch_command(cmd: str) -> None:
             print(f"error: graph file not found: {gp}", file=sys.stderr)
             sys.exit(1)
         _enforce_graph_size_cap_or_exit(gp)
-        _raw = json.loads(gp.read_text(encoding="utf-8"))
-        if "links" not in _raw and "edges" in _raw:
-            _raw = dict(_raw, links=_raw["edges"])
         # Force directed so the renderer can recover stored caller→callee
         # direction, and multigraph so exact-pair parallel links (e.g. a
         # `references` and a `calls` edge between the same two nodes) survive load
         # instead of being silently collapsed last-writer-wins — otherwise the
         # printed relation could be one the traversed pair doesn't actually
         # carry (#2074). Local to this read; serve's shared graph is untouched.
-        _raw = {**_raw, "directed": True, "multigraph": True}
-        try:
-            G = json_graph.node_link_graph(_raw, edges="links")
-        except TypeError:
-            G = json_graph.node_link_graph(_raw)
+        # Both flags are part of the cache key, so this never gets served
+        # serve's undirected simple graph.
+        from graphify.serve import load_graph_cached
+        G = load_graph_cached(gp, directed=True, multigraph=True)
         # Let serve._get_trigram_index find its on-disk cache. This path does
         # not go through serve._load_graph, which is where the stash normally
         # happens, so without this the cache key is unresolvable and every CLI
@@ -1721,15 +1760,11 @@ def dispatch_command(cmd: str) -> None:
             print(f"error: graph file not found: {gp}", file=sys.stderr)
             sys.exit(1)
         _enforce_graph_size_cap_or_exit(gp)
-        _raw = json.loads(gp.read_text(encoding="utf-8"))
-        if "links" not in _raw and "edges" in _raw:
-            _raw = dict(_raw, links=_raw["edges"])
-        # Force directed so the renderer can recover stored caller→callee direction.
-        _raw = {**_raw, "directed": True}
-        try:
-            G = json_graph.node_link_graph(_raw, edges="links")
-        except TypeError:
-            G = json_graph.node_link_graph(_raw)
+        # Force directed so the renderer can recover stored caller→callee
+        # direction. The flag is part of the cache key, so this never gets
+        # served serve's undirected graph.
+        from graphify.serve import load_graph_cached
+        G = load_graph_cached(gp, directed=True, multigraph=False)
         # Let serve._get_trigram_index find its on-disk cache. This path does
         # not go through serve._load_graph, which is where the stash normally
         # happens, so without this the cache key is unresolvable and every CLI

@@ -35,6 +35,41 @@ class ToolError(Exception):
     """
 
 
+def _attach_graph_sidecars(G, resolved: Path):
+    """Set the graph attrs that do NOT come from graph.json's bytes.
+
+    Split out because `_load_graph` can now return a cached graph, and these
+    three must be recomputed on every load rather than pickled with it:
+
+    - `_learning_overlay` is read from a SEPARATE sidecar next to graph.json,
+      which changes independently. Caching it would serve a stale overlay
+      whenever `graphify reflect` ran without a rebuild -- a wrong answer with
+      nothing to indicate it.
+    - `_graph_path` is the trigram cache key and must name the file actually
+      loaded, not whatever path the pickle was written from.
+    - the legacy-ID note is a stderr nudge; suppressing it on a cache hit would
+      make the same command advise a rebuild only every other run.
+    """
+    try:
+        from graphify.build import graph_has_legacy_ids as _legacy
+        nodes = [{"id": n, **d} for n, d in G.nodes(data=True)]
+        if _legacy(nodes):
+            print(
+                "[graphify] note: this graph uses the pre-#1504 node-ID scheme; "
+                "rebuild with `graphify extract --force` for path-qualified IDs.",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+    try:
+        from graphify.reflect import load_learning_overlay as _llo
+        G.graph["_learning_overlay"] = _llo(resolved)
+    except Exception:
+        G.graph["_learning_overlay"] = {}
+    G.graph["_graph_path"] = str(resolved)
+    return G
+
+
 def _load_graph(graph_path: str) -> nx.Graph:
     try:
         resolved = Path(graph_path).resolve()
@@ -43,6 +78,18 @@ def _load_graph(graph_path: str) -> nx.Graph:
         if not resolved.exists():
             raise FileNotFoundError(f"Graph file not found: {resolved}")
         check_graph_file_size_cap(resolved)
+        # Cached parse. Only the structure and `_logical_directed` come from
+        # graph.json's bytes and are safe to pickle; the sidecar-derived attrs
+        # are reattached below on both paths.
+        _key = _graph_cache_key(resolved, directed=True, multigraph=False)
+        if _key is not None:
+            try:
+                with _graph_cache_path(_key[0], _key).open("rb") as _fh:
+                    _blob = pickle.load(_fh)
+                if _blob.get("key") == _key:
+                    return _attach_graph_sidecars(_blob["graph"], resolved)
+            except Exception:
+                pass
         safe = resolved
         data = json.loads(safe.read_text(encoding="utf-8"))
         if "links" not in data and "edges" in data:
@@ -54,33 +101,18 @@ def _load_graph(graph_path: str) -> nx.Graph:
         _logical_directed = bool(data.get("directed", False))
         data = {**data, "directed": True}
         try:
-            from graphify.build import graph_has_legacy_ids as _legacy
-            if _legacy(data.get("nodes", [])):
-                print(
-                    "[graphify] note: this graph uses the pre-#1504 node-ID scheme; "
-                    "rebuild with `graphify extract --force` for path-qualified IDs.",
-                    file=sys.stderr,
-                )
-        except Exception:
-            pass
-        try:
             G = json_graph.node_link_graph(data, edges="links")
         except TypeError:
             G = json_graph.node_link_graph(data)
         G.graph["_logical_directed"] = _logical_directed
-        # Attach the work-memory overlay (derived sidecar next to graph.json) so
-        # the query/MCP read surface can annotate NODE lines display-only. Empty
-        # when no sidecar exists, leaving un-annotated output byte-identical.
-        try:
-            from graphify.reflect import load_learning_overlay as _llo
-            G.graph["_learning_overlay"] = _llo(resolved)
-        except Exception:
-            G.graph["_learning_overlay"] = {}
-        # Source path for the on-disk trigram cache key (`_get_trigram_index`).
-        # The index is derived purely from this file, so its mtime and size are
-        # a sufficient generation marker.
-        G.graph["_graph_path"] = str(resolved)
-        return G
+        if _key is not None:
+            try:
+                _dest = _graph_cache_path(_key[0], _key)
+                _atomic_write_pickle(_dest, {"key": _key, "graph": G})
+                _prune_graph_cache(_dest)
+            except Exception:
+                pass
+        return _attach_graph_sidecars(G, resolved)
     except json.JSONDecodeError as exc:
         print(f"error: graph.json is corrupted ({exc}). Re-run /graphify to rebuild.", file=sys.stderr)
         sys.exit(1)
@@ -551,6 +583,118 @@ def _store_trigram_cache(G: nx.Graph, idx: dict) -> None:
         _prune_trigram_cache(_dest)
     except Exception:
         pass
+
+
+#: Bump when the shape of what we pickle changes in a way an old file would
+#: load wrongly rather than fail loudly.
+_GRAPH_CACHE_VERSION = 1
+
+
+def _graph_cache_key(graph_path, *, directed: bool, multigraph: bool):
+    """Identity of a parsed graph, or None when it must not be cached.
+
+    Covers more than the source file. A pickled networkx Graph stores the
+    classes it was built from, so a networkx or Python upgrade can make an old
+    file load subtly wrong rather than fail -- both versions are in the key.
+    So are `directed`/`multigraph`: `explain` and `path` deliberately load
+    directed multigraphs so parallel edges survive (#2074) while serve loads an
+    undirected simple graph, and handing one the other's shape would change
+    results with no error.
+    """
+    if os.environ.get("GRAPHIFY_GRAPH_CACHE_DISABLE", "").lower() in ("1", "true", "yes"):
+        return None
+    try:
+        st = Path(graph_path).stat()
+    except OSError:
+        return None
+    return [
+        str(Path(graph_path).resolve()), _GRAPH_CACHE_VERSION,
+        st.st_mtime_ns, st.st_size,
+        nx.__version__, "%d.%d" % sys.version_info[:2],
+        bool(directed), bool(multigraph),
+    ]
+
+
+def _graph_cache_path(graph_path: str, key) -> Path:
+    """Where the parsed graph is cached. Same directory as the trigram index,
+    for the same reason: outside the corpus, so no VCS ever sees it.
+
+    The name carries two digests rather than one. `gen` identifies the source
+    file's contents (path, mtime, size); `shape` identifies everything else in
+    the key -- the directed/multigraph flags and the networkx/Python versions.
+    Splitting them is what makes pruning possible: `explain` and `path` load
+    the same graph in two different shapes and must not evict each other, but
+    every entry from a superseded graph.json can go. The trigram cache splits
+    its name the same way but needs only the one digest, since it has no
+    equivalent of shape: one index per graph file, where this holds several
+    live entries per path.
+    """
+    base = _trigram_cache_path(graph_path).parent
+    gen = hashlib.sha1(repr(key[:4]).encode("utf-8")).hexdigest()[:12]
+    shape = hashlib.sha1(repr(key[4:]).encode("utf-8")).hexdigest()[:8]
+    return base / f"graph-{gen}-{shape}.pkl"
+
+
+def _prune_graph_cache(dest: Path) -> None:
+    """Delete cached graphs from superseded generations of the same graph.json.
+
+    Each entry is ~175 MB on a 285k-node graph, and a rebuild changes the
+    generation digest, so without this every regen leaves another copy behind.
+    Only entries whose generation differs from the one just written are
+    removed, which keeps the sibling shapes of the current graph. Never
+    raises: a failure here costs disk, not correctness.
+    """
+    try:
+        gen = dest.name.split("-")[1]
+        for old in dest.parent.glob("graph-*-*.pkl"):
+            if old != dest and old.name.split("-")[1] != gen:
+                old.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def load_graph_cached(graph_path, *, directed: bool, multigraph: bool):
+    """Parse graph.json into a networkx graph, reusing an on-disk pickle.
+
+    Rebuilding the graph object dominates every CLI call: on a 285k-node,
+    445k-edge graph, reading the 301 MB file costs 0.04s, `json.loads` 1.14s
+    and the networkx construction 2.20s, against 0.78s to unpickle the built
+    graph. Nothing here is a hot loop -- the whole graph is rebuilt to answer
+    about one node -- but caching it is a small change where fixing that is
+    not.
+
+    Never raises for cache reasons: any miss, stale key or unreadable file
+    falls through to the JSON path, so the worst case is the cost we already
+    paid. Returns the graph.
+    """
+    key = _graph_cache_key(graph_path, directed=directed, multigraph=multigraph)
+    if key is not None:
+        try:
+            with _graph_cache_path(key[0], key).open("rb") as fh:
+                blob = pickle.load(fh)
+            if blob.get("key") == key:
+                return blob["graph"]
+        except Exception:
+            pass
+
+    from networkx.readwrite import json_graph
+    raw = json.loads(Path(graph_path).read_text(encoding="utf-8"))
+    if "links" not in raw and "edges" in raw:
+        raw = dict(raw, links=raw["edges"])
+    raw = {**raw, "directed": directed, "multigraph": multigraph}
+    try:
+        G = json_graph.node_link_graph(raw, edges="links")
+    except TypeError:  # networkx too old for the edges kwarg
+        G = json_graph.node_link_graph(raw)
+
+    if key is not None:
+        try:
+            dest = _graph_cache_path(key[0], key)
+            _atomic_write_pickle(dest, {"key": key, "graph": G})
+            _prune_graph_cache(dest)
+        except Exception:
+            pass
+    return G
 
 
 def _get_trigram_index(G: nx.Graph) -> dict:
