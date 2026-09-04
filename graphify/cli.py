@@ -1590,16 +1590,34 @@ def dispatch_command(cmd: str) -> None:
             G = json_graph.node_link_graph(_raw, edges="links")
         except TypeError:
             G = json_graph.node_link_graph(_raw)
-        src_scored = _score_nodes(G, [t.lower() for t in source_label.split()])
-        tgt_scored = _score_nodes(G, [t.lower() for t in target_label.split()])
-        if not src_scored:
+        # Only labels are scored; an exact node id resolves directly. An id
+        # is a single whitespace token, so scoring one against labels ranks
+        # it like prose: the top scores land near-tied, which trips the
+        # ambiguity warning below, and the winner need not be the node the
+        # id names. `explain` short-circuits the same way, in
+        # serve._find_node_tiers.
+        src_exact = G.has_node(source_label)
+        tgt_exact = G.has_node(target_label)
+        src_scored = [] if src_exact else _score_nodes(
+            G, [t.lower() for t in source_label.split()]
+        )
+        tgt_scored = [] if tgt_exact else _score_nodes(
+            G, [t.lower() for t in target_label.split()]
+        )
+        if not src_exact and not src_scored:
             print(f"No node matching '{source_label}' found.", file=sys.stderr)
             sys.exit(1)
-        if not tgt_scored:
+        if not tgt_exact and not tgt_scored:
             print(f"No node matching '{target_label}' found.", file=sys.stderr)
             sys.exit(1)
-        src_nid = _pick_scored_endpoint(G, src_scored, source_label)
-        tgt_nid = _pick_scored_endpoint(G, tgt_scored, target_label)
+        # An exact hit leaves `scored` empty, which the warning below already
+        # treats as unambiguous via its len(_scored) >= 2 guard.
+        src_nid = source_label if src_exact else _pick_scored_endpoint(
+            G, src_scored, source_label
+        )
+        tgt_nid = target_label if tgt_exact else _pick_scored_endpoint(
+            G, tgt_scored, target_label
+        )
         # Ambiguity guard: when both queries resolve to the same node, the
         # shortest path is trivially zero hops, which is almost never what the
         # caller wanted (see bug #828).
